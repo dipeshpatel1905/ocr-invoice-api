@@ -5,7 +5,7 @@ from PIL import Image
 import io
 import pytesseract
 import re
-import pandas as pd # Although not directly used for the final return, good for tabular data handling
+import pandas as pd
 import numpy as np # For OpenCV image conversion
 import cv2 # For image processing
 
@@ -73,20 +73,20 @@ def append_to_sheet(sheet_name: str, values: list):
 def preprocess_image_for_ocr(pil_image):
     """
     Applies basic OpenCV pre-processing to an image for better OCR results.
-    Converts PIL Image to grayscale and applies adaptive thresholding.
+    Converts PIL Image to grayscale. Adaptive thresholding is temporarily
+    commented out for debugging.
     """
     # Convert PIL Image to OpenCV format (numpy array)
     img_cv = np.array(pil_image)
     if len(img_cv.shape) == 3: # If image is color, convert to grayscale
         img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
 
-    # Apply adaptive thresholding to get clear black and white image
-    # blockSize: Size of a pixel neighborhood that is used to calculate a threshold value.
-    # C: A constant subtracted from the mean or weighted mean. Normally, it is positive.
-    # These values (11, 2) often work well for documents. Adjust if needed.
-    processed_img_cv = cv2.adaptiveThreshold(
-        img_cv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-    )
+    # --- TEMPORARILY COMMENTED OUT ADAPTIVE THRESHOLDING FOR DEBUGGING ---
+    # processed_img_cv = cv2.adaptiveThreshold(
+    #     img_cv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    # )
+    # --- Using the grayscale image directly for now ---
+    processed_img_cv = img_cv
 
     # Convert back to PIL Image for pytesseract
     return Image.fromarray(processed_img_cv)
@@ -110,6 +110,9 @@ async def extract_invoice_data(image: UploadFile = File(...)):
         # config='--psm 6' is often good for a single block of text (like a form)
         # config='--psm 3' (default) is for automatic page segmentation, try if 6 fails
         raw_text = pytesseract.image_to_string(processed_pil_image, lang='eng', config='--psm 6')
+        # You could also try PSM 3 for testing:
+        # raw_text = pytesseract.image_to_string(processed_pil_image, lang='eng', config='--psm 3')
+
 
         print("\n--- Raw OCR Text (after preprocessing) ---")
         print(raw_text)
