@@ -2,14 +2,11 @@
 FROM python:3.9-slim-buster
 
 # Install Tesseract OCR and its language data (English)
-# apt-get update: Updates the list of available packages
-# apt-get install -y: Installs packages without asking for confirmation
-# tesseract-ocr: The Tesseract OCR engine itself
-# libtesseract-dev: Development libraries for Tesseract (sometimes needed by pytesseract bindings)
-# tesseract-ocr-eng: English language data for Tesseract
-# apt-get clean & rm -rf: Cleans up downloaded package files to keep the image small
+# Add OpenCV dependencies (libgl1, libsm6, libxrender1)
+# These are common dependencies required by opencv-python on Linux
 RUN apt-get update && \
-    apt-get install -y tesseract-ocr libtesseract-dev tesseract-ocr-eng && \
+    apt-get install -y tesseract-ocr libtesseract-dev tesseract-ocr-eng \
+                       libgl1 libsm6 libxrender1 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
