@@ -1,4 +1,4 @@
-import logging, io, re
+import logging, io, re, os, json
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -8,7 +8,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Logging
+# Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger()
 
@@ -24,13 +24,17 @@ app.add_middleware(
 )
 
 # Google Sheets config
-SERVICE_ACCOUNT_FILE = 'service_account.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SPREADSHEET_ID = '12Dgde7jGtlpJHoefyXiG8tecveQ6qc-mwzUyI3FTPrY'
 
 def get_sheets_service():
     try:
-        creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        google_creds_json = os.environ.get("GOOGLE_CREDS")
+        if not google_creds_json:
+            raise RuntimeError("GOOGLE_CREDS env variable not set")
+
+        creds_dict = json.loads(google_creds_json)
+        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         return build('sheets', 'v4', credentials=creds)
     except Exception as e:
         logger.error("❌ Sheets auth error: %s", e)
@@ -39,7 +43,7 @@ def get_sheets_service():
 def append_to_sheet(sheet, values):
     try:
         svc = get_sheets_service()
-        str_values = [str(v) if v is not None else '' for v in values]  # ✅ Cast all to string
+        str_values = [str(v) if v is not None else '' for v in values]
         body = {'values': [str_values]}
         svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
@@ -61,7 +65,6 @@ def preprocess_table(img):
     _, th = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     inv = cv2.bitwise_not(th)
 
-    # Detect vertical & horizontal lines
     vkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, img.shape[0]//100))
     hkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (img.shape[1]//40, 1))
     vlines = cv2.dilate(cv2.erode(inv, vkernel, iterations=3), vkernel, iterations=3)
@@ -75,7 +78,7 @@ def extract_table_cells(clean_img, orig_img):
     conts, _ = cv2.findContours(clean_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     cells = []
     for c in conts:
-        x,y,w,h = cv2.boundingRect(c)
+        x, y, w, h = cv2.boundingRect(c)
         if w > 30 and h > 15:
             cell = orig_img[y:y+h, x:x+w]
             text = pytesseract.image_to_string(cell, lang='eng', config='--psm 7').strip()
