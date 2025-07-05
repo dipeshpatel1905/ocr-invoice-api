@@ -15,6 +15,7 @@ logger = logging.getLogger()
 # Tesseract config
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
+# FastAPI app setup
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -22,6 +23,7 @@ app.add_middleware(
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
+# Google Sheets config
 SERVICE_ACCOUNT_FILE = 'service_account.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SPREADSHEET_ID = '12Dgde7jGtlpJHoefyXiG8tecveQ6qc-mwzUyI3FTPrY'
@@ -31,22 +33,27 @@ def get_sheets_service():
         creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         return build('sheets', 'v4', credentials=creds)
     except Exception as e:
-        logger.error("Sheets auth error: %s", e)
+        logger.error("❌ Sheets auth error: %s", e)
         raise HTTPException(500, "Google Sheets auth failed")
 
 def append_to_sheet(sheet, values):
     try:
         svc = get_sheets_service()
+        str_values = [str(v) if v is not None else '' for v in values]  # ✅ Cast all to string
+        body = {'values': [str_values]}
         svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
             range=sheet + "!A:Z",
             valueInputOption='USER_ENTERED',
             insertDataOption='INSERT_ROWS',
-            body={'values': [values]}
+            body=body
         ).execute()
-        logger.info(f"✓ Appended row to {sheet}: {values}")
+        logger.info(f"✅ Appended row to {sheet}: {str_values}")
+    except HttpError as e:
+        logger.error("❌ Google Sheets API error: %s", e)
+        raise HTTPException(500, f"Google Sheets API error: {e}")
     except Exception as e:
-        logger.error("Failed writing to sheet:", e)
+        logger.error("❌ Unexpected error writing to sheet: %s", e)
         raise HTTPException(500, "Sheet append failed")
 
 def preprocess_table(img):
@@ -60,7 +67,6 @@ def preprocess_table(img):
     vlines = cv2.dilate(cv2.erode(inv, vkernel, iterations=3), vkernel, iterations=3)
     hlines = cv2.dilate(cv2.erode(inv, hkernel, iterations=3), hkernel, iterations=3)
 
-    # Subtract lines from inv image to isolate text
     mask = cv2.addWeighted(vlines, 0.5, hlines, 0.5, 0.0)
     clean = cv2.subtract(inv, mask)
     return clean
@@ -70,15 +76,14 @@ def extract_table_cells(clean_img, orig_img):
     cells = []
     for c in conts:
         x,y,w,h = cv2.boundingRect(c)
-        if w>30 and h>15:
+        if w > 30 and h > 15:
             cell = orig_img[y:y+h, x:x+w]
             text = pytesseract.image_to_string(cell, lang='eng', config='--psm 7').strip()
-            cells.append((x,y,text))
-    # Sort cells by row & column
+            cells.append((x, y, text))
     rows = {}
-    for x,y,text in cells:
-        key = y//20  # approximate row index
-        rows.setdefault(key, []).append((x, text))
+    for x, y, text in cells:
+        row_key = y // 20
+        rows.setdefault(row_key, []).append((x, text))
     table = []
     for row in sorted(rows):
         table.append([text for x, text in sorted(rows[row])])
@@ -87,9 +92,19 @@ def extract_table_cells(clean_img, orig_img):
 @app.post("/extract-invoice-data/")
 async def extract_invoice_data(image: UploadFile = File(...)):
     logger.info("📥 Received %s", image.filename)
-    data = {'Sales_Invoice_No':'N/A','Customer_Name':'N/A','Date':'N/A','TAX_NUMBER':'N/A',
-            'Company_Name':'N/A','Items':[], 'Total_Summary':'N/A','Discount':'N/A',
-            'Net_Amount':'N/A','Sales_Tax':'N/A','table':[]}
+    data = {
+        'Sales_Invoice_No': 'N/A',
+        'Customer_Name': 'N/A',
+        'Date': 'N/A',
+        'TAX_NUMBER': 'N/A',
+        'Company_Name': 'N/A',
+        'Items': [],
+        'Total_Summary': 'N/A',
+        'Discount': 'N/A',
+        'Net_Amount': 'N/A',
+        'Sales_Tax': 'N/A',
+        'table': []
+    }
 
     try:
         buf = await image.read()
@@ -101,12 +116,12 @@ async def extract_invoice_data(image: UploadFile = File(...)):
         logger.info("✅ Extracted table with %d rows", len(table))
 
         raw = pytesseract.image_to_string(pil, lang='eng', config='--psm 6')
-        logger.info("OCR Text:\n%s", raw)
+        logger.info("🧾 OCR Text:\n%s", raw)
 
         def grab(pattern, label):
             m = re.search(pattern, raw, re.IGNORECASE)
             val = m.group(1).strip() if m else 'N/A'
-            logger.info("%s → %s", label, val)
+            logger.info(f"{label} → {val}")
             data[label] = val
 
         grab(r'invoice\s*(?:no|number)?[:\-]?\s*([A-Z0-9\-]+)', 'Sales_Invoice_No')
@@ -115,16 +130,19 @@ async def extract_invoice_data(image: UploadFile = File(...)):
         grab(r'(?:tax number|vat)\s*[:\-]?\s*([0-9]{5,15})', 'TAX_NUMBER')
         grab(r'(bread\s*basket\s*company)', 'Company_Name')
 
-        if data['Sales_Invoice_No']!='N/A':
+        if data['Sales_Invoice_No'] != 'N/A':
             append_to_sheet('Sheet1', [
-                data['Sales_Invoice_No'], data['Customer_Name'], data['Date'],
-                data['TAX_NUMBER'], data['Company_Name'],
-                data['Total_Summary']
+                data.get('Sales_Invoice_No'),
+                data.get('Customer_Name'),
+                data.get('Date'),
+                data.get('TAX_NUMBER'),
+                data.get('Company_Name'),
+                data.get('Total_Summary')
             ])
         else:
-            logger.warning("❗ No invoice number – skipping sheet write")
+            logger.warning("⚠️ No invoice number – skipping sheet write")
 
-        return JSONResponse({"status":"success","data":data})
+        return JSONResponse({"status": "success", "data": data})
     except Exception as e:
-        logger.exception("Failed processing")
+        logger.exception("❌ Processing failed")
         raise HTTPException(500, str(e))
