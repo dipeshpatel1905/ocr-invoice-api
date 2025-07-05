@@ -1,6 +1,7 @@
+import logging
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware  # ✅ NEW
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import io
 import pytesseract
@@ -12,16 +13,22 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# --- Tesseract config ---
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Tesseract path (adjust if needed for Render)
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
-# --- FastAPI App ---
 app = FastAPI()
 
 # ✅ CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://app.cloudsyncdigital.com"],  # Frontend origin
+    allow_origins=["https://app.cloudsyncdigital.com"],  # Or ["*"] for development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,15 +39,18 @@ SERVICE_ACCOUNT_FILE = 'service_account.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SPREADSHEET_ID = '12Dgde7jGtlpJHoefyXiG8tecveQ6qc-mwzUyI3FTPrY'
 
-# --- Google Sheets Helpers ---
+
 def get_sheets_service():
     try:
         creds = service_account.Credentials.from_service_account_file(
             SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         service = build('sheets', 'v4', credentials=creds)
+        logger.info("✅ Google Sheets service initialized.")
         return service
-    except HttpError:
+    except HttpError as error:
+        logger.error("❌ Google Sheets auth error: %s", error)
         raise HTTPException(status_code=500, detail="Google Sheets authentication error.")
+
 
 def append_to_sheet(sheet_name: str, values: list):
     service = get_sheets_service()
@@ -54,14 +64,18 @@ def append_to_sheet(sheet_name: str, values: list):
             insertDataOption='INSERT_ROWS',
             body=body
         ).execute()
+        logger.info(f"✅ Appended row to {sheet_name}: {values}")
         return result.get('updates', {}).get('updatedCells', 0)
     except HttpError as error:
+        logger.error(f"❌ Error appending to sheet {sheet_name}: %s", error)
         raise HTTPException(status_code=500, detail=f"Error appending to sheet: {error}")
     except Exception as e:
+        logger.exception("Unexpected error while appending to sheet")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
-# --- OCR Preprocessing ---
+
 def preprocess_image_for_ocr(pil_image):
+    logger.info("🔧 Preprocessing image for OCR...")
     img_cv = np.array(pil_image)
     if len(img_cv.shape) == 3:
         img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
@@ -69,16 +83,22 @@ def preprocess_image_for_ocr(pil_image):
     processed_img_cv = cv2.adaptiveThreshold(
         blurred_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
     )
+    logger.info("✅ Image preprocessing complete.")
     return Image.fromarray(processed_img_cv)
 
-# --- Main Endpoint ---
+
 @app.post("/extract-invoice-data/")
 async def extract_invoice_data(image: UploadFile = File(...)):
+    logger.info("📥 Received file upload: %s", image.filename)
+
     try:
         image_bytes = await image.read()
         pil_image = Image.open(io.BytesIO(image_bytes))
-        processed_pil_image = preprocess_image_for_ocr(pil_image)
-        raw_text = pytesseract.image_to_string(processed_pil_image, lang='eng', config='--psm 6')
+
+        # Preprocess and OCR
+        processed_image = preprocess_image_for_ocr(pil_image)
+        raw_text = pytesseract.image_to_string(processed_image, lang='eng', config='--psm 6')
+        logger.info("✅ OCR complete.")
 
         extracted_data = {}
 
@@ -86,14 +106,13 @@ async def extract_invoice_data(image: UploadFile = File(...)):
             match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
             return match.group(1).strip() if match else default
 
-        # Extracted Fields
+        # Extract fields
         extracted_data['Sales_Invoice_No'] = safe_search(r'Invoice No\W*(\d+)', raw_text)
         extracted_data['Customer_Name'] = safe_search(r'Customer:\W*(.+?)(?=\nDate|TAX NUMBER|$)', raw_text)
         extracted_data['Date'] = safe_search(r'Date:\W*(\d{2}/\d{2}/\d{4})', raw_text)
         extracted_data['TAX_NUMBER'] = safe_search(r'TAX NUMBER:\W*(\d+)', raw_text)
         extracted_data['Company_Name'] = safe_search(r'BREAD BASKET\s*COMPANY', raw_text)
 
-        # Item Table Extraction
         items_raw = re.findall(r'^\s*(\d+)\s+(.+?)\s+([\d.]+)\s+([A-Za-z]+)\s+([\d.]+)\s+([\d.]+)', raw_text, re.MULTILINE)
         extracted_data['Items'] = []
         for row in items_raw:
@@ -107,15 +126,15 @@ async def extract_invoice_data(image: UploadFile = File(...)):
             }
             extracted_data['Items'].append(item_dict)
 
-        # Totals
         extracted_data['Total_Summary'] = safe_search(r'Total:\W*([\d.]+)', raw_text)
         extracted_data['Discount'] = safe_search(r'Discount:\W*([\d.]+)', raw_text)
         extracted_data['Net_Amount'] = safe_search(r'Net:\W*([\d.]+)', raw_text)
         extracted_data['Sales_Tax'] = safe_search(r'Sales tax:\W*([\d.]+)', raw_text)
 
-        # Append to Google Sheets
+        logger.info("📄 Extracted invoice data: %s", extracted_data)
+
         if extracted_data['Sales_Invoice_No'] != 'N/A':
-            sheet1_row_values = [
+            sheet1_row = [
                 extracted_data.get('Sales_Invoice_No', ''),
                 extracted_data.get('Customer_Name', ''),
                 extracted_data.get('Date', ''),
@@ -123,10 +142,10 @@ async def extract_invoice_data(image: UploadFile = File(...)):
                 extracted_data.get('Company_Name', ''),
                 extracted_data['Total_Summary']
             ]
-            append_to_sheet('Sheet1', sheet1_row_values)
+            append_to_sheet('Sheet1', sheet1_row)
 
             for item in extracted_data['Items']:
-                sheet2_row_values = [
+                sheet2_row = [
                     extracted_data['Sales_Invoice_No'],
                     item['Item_No'],
                     item['Item_Name'],
@@ -135,11 +154,11 @@ async def extract_invoice_data(image: UploadFile = File(...)):
                     item['Price'],
                     item['Total_Price']
                 ]
-                append_to_sheet('Sheet2', sheet2_row_values)
+                append_to_sheet('Sheet2', sheet2_row)
 
+        logger.info("✅ Successfully processed and saved invoice.")
         return JSONResponse(content={"status": "success", "data": extracted_data})
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.exception("❌ Error processing invoice")
         raise HTTPException(status_code=500, detail=f"Error processing invoice data: {e}")
