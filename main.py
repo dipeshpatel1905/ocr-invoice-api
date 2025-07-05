@@ -1,37 +1,27 @@
-import logging
+import logging, io, re
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from PIL import Image
-import io
-import pytesseract
-import re
-import numpy as np
-import cv2
+import pytesseract, numpy as np, cv2
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Configure logging
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
 # Tesseract config
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
-# FastAPI app
 app = FastAPI()
-
-# Enable CORS for your frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://app.cloudsyncdigital.com"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-# Google Sheets setup
 SERVICE_ACCOUNT_FILE = 'service_account.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SPREADSHEET_ID = '12Dgde7jGtlpJHoefyXiG8tecveQ6qc-mwzUyI3FTPrY'
@@ -39,87 +29,102 @@ SPREADSHEET_ID = '12Dgde7jGtlpJHoefyXiG8tecveQ6qc-mwzUyI3FTPrY'
 def get_sheets_service():
     try:
         creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-        service = build('sheets', 'v4', credentials=creds)
-        logger.info("✅ Google Sheets connected.")
-        return service
-    except HttpError as error:
-        logger.error("❌ Sheets auth error: %s", error)
-        raise HTTPException(status_code=500, detail="Google Sheets auth failed.")
+        return build('sheets', 'v4', credentials=creds)
+    except Exception as e:
+        logger.error("Sheets auth error: %s", e)
+        raise HTTPException(500, "Google Sheets auth failed")
 
-def append_to_sheet(sheet_name: str, values: list):
-    service = get_sheets_service()
-    range_name = f'{sheet_name}!A:Z'
-    body = {'values': [values]}
+def append_to_sheet(sheet, values):
     try:
-        service.spreadsheets().values().append(
+        svc = get_sheets_service()
+        svc.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range=range_name,
+            range=sheet + "!A:Z",
             valueInputOption='USER_ENTERED',
             insertDataOption='INSERT_ROWS',
-            body=body
+            body={'values': [values]}
         ).execute()
-        logger.info(f"📄 Row added to {sheet_name}: {values}")
-    except HttpError as error:
-        logger.error(f"❌ Failed to write to {sheet_name}: {error}")
-        raise HTTPException(status_code=500, detail="Sheet append failed.")
+        logger.info(f"✓ Appended row to {sheet}: {values}")
+    except Exception as e:
+        logger.error("Failed writing to sheet:", e)
+        raise HTTPException(500, "Sheet append failed")
 
-def preprocess_image_for_ocr(pil_image):
-    logger.info("🔧 Preprocessing image...")
-    img_cv = np.array(pil_image)
-    if len(img_cv.shape) == 3:
-        img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(img_cv, (5, 5), 0)
-    thresholded = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY, 11, 2)
-    return Image.fromarray(thresholded)
+def preprocess_table(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, th = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    inv = cv2.bitwise_not(th)
+
+    # Detect vertical & horizontal lines
+    vkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, img.shape[0]//100))
+    hkernel = cv2.getStructuringElement(cv2.MORPH_RECT, (img.shape[1]//40, 1))
+    vlines = cv2.dilate(cv2.erode(inv, vkernel, iterations=3), vkernel, iterations=3)
+    hlines = cv2.dilate(cv2.erode(inv, hkernel, iterations=3), hkernel, iterations=3)
+
+    # Subtract lines from inv image to isolate text
+    mask = cv2.addWeighted(vlines, 0.5, hlines, 0.5, 0.0)
+    clean = cv2.subtract(inv, mask)
+    return clean
+
+def extract_table_cells(clean_img, orig_img):
+    conts, _ = cv2.findContours(clean_img, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    cells = []
+    for c in conts:
+        x,y,w,h = cv2.boundingRect(c)
+        if w>30 and h>15:
+            cell = orig_img[y:y+h, x:x+w]
+            text = pytesseract.image_to_string(cell, lang='eng', config='--psm 7').strip()
+            cells.append((x,y,text))
+    # Sort cells by row & column
+    rows = {}
+    for x,y,text in cells:
+        key = y//20  # approximate row index
+        rows.setdefault(key, []).append((x, text))
+    table = []
+    for row in sorted(rows):
+        table.append([text for x, text in sorted(rows[row])])
+    return table
 
 @app.post("/extract-invoice-data/")
 async def extract_invoice_data(image: UploadFile = File(...)):
-    logger.info("📥 Uploaded file: %s", image.filename)
+    logger.info("📥 Received %s", image.filename)
+    data = {'Sales_Invoice_No':'N/A','Customer_Name':'N/A','Date':'N/A','TAX_NUMBER':'N/A',
+            'Company_Name':'N/A','Items':[], 'Total_Summary':'N/A','Discount':'N/A',
+            'Net_Amount':'N/A','Sales_Tax':'N/A','table':[]}
 
     try:
-        image_bytes = await image.read()
-        pil_image = Image.open(io.BytesIO(image_bytes))
-        processed_image = preprocess_image_for_ocr(pil_image)
+        buf = await image.read()
+        pil = Image.open(io.BytesIO(buf)).convert("RGB")
+        img = np.array(pil)
+        clean = preprocess_table(img)
+        table = extract_table_cells(clean, img)
+        data['table'] = table
+        logger.info("✅ Extracted table with %d rows", len(table))
 
-        raw_text = pytesseract.image_to_string(processed_image, lang='eng', config='--psm 6')
-        logger.info("🧾 OCR Result:\n%s", raw_text)
+        raw = pytesseract.image_to_string(pil, lang='eng', config='--psm 6')
+        logger.info("OCR Text:\n%s", raw)
 
-        def safe_search(pattern, text, label):
-            match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-            result = match.group(1).strip() if match else 'N/A'
-            logger.info(f"🔍 {label}: {result}")
-            return result
+        def grab(pattern, label):
+            m = re.search(pattern, raw, re.IGNORECASE)
+            val = m.group(1).strip() if m else 'N/A'
+            logger.info("%s → %s", label, val)
+            data[label] = val
 
-        # Extracted fields with improved regex
-        extracted_data = {
-            'Sales_Invoice_No': safe_search(r'invoice\s*(?:no|number)?[:\-]?\s*([A-Z0-9\-]+)', raw_text, 'Sales_Invoice_No'),
-            'Customer_Name': safe_search(r'customer\s*[:\-]?\s*(.+?)(?:\n|date|tax|vat)', raw_text, 'Customer_Name'),
-            'Date': safe_search(r'date\s*[:\-]?\s*([0-9]{2}[\/\-][0-9]{2}[\/\-][0-9]{2,4})', raw_text, 'Date'),
-            'TAX_NUMBER': safe_search(r'(?:tax number|vat number|vat no|tax)\s*[:\-]?\s*([0-9]{5,15})', raw_text, 'TAX_NUMBER'),
-            'Company_Name': safe_search(r'(bread\s*basket\s*company)', raw_text, 'Company_Name'),
-            'Items': [],
-            'Total_Summary': 'N/A',
-            'Discount': 'N/A',
-            'Net_Amount': 'N/A',
-            'Sales_Tax': 'N/A'
-        }
+        grab(r'invoice\s*(?:no|number)?[:\-]?\s*([A-Z0-9\-]+)', 'Sales_Invoice_No')
+        grab(r'customer\s*[:\-]?\s*(.+?)(?=\n|date|tax|vat)', 'Customer_Name')
+        grab(r'date\s*[:\-]?\s*([0-9]{2}[\/\-][0-9]{2}[\/\-][0-9]{2,4})', 'Date')
+        grab(r'(?:tax number|vat)\s*[:\-]?\s*([0-9]{5,15})', 'TAX_NUMBER')
+        grab(r'(bread\s*basket\s*company)', 'Company_Name')
 
-        # Append to Sheet1 only if Invoice Number found
-        if extracted_data['Sales_Invoice_No'] != 'N/A':
+        if data['Sales_Invoice_No']!='N/A':
             append_to_sheet('Sheet1', [
-                extracted_data['Sales_Invoice_No'],
-                extracted_data['Customer_Name'],
-                extracted_data['Date'],
-                extracted_data['TAX_NUMBER'],
-                extracted_data['Company_Name'],
-                extracted_data['Total_Summary']
+                data['Sales_Invoice_No'], data['Customer_Name'], data['Date'],
+                data['TAX_NUMBER'], data['Company_Name'],
+                data['Total_Summary']
             ])
         else:
-            logger.warning("⚠️ Invoice number not found — skipping sheet update.")
+            logger.warning("❗ No invoice number – skipping sheet write")
 
-        return JSONResponse(content={"status": "success", "data": extracted_data})
-
+        return JSONResponse({"status":"success","data":data})
     except Exception as e:
-        logger.exception("❌ Invoice processing failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Failed processing")
+        raise HTTPException(500, str(e))
