@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware  # ✅ NEW
 from PIL import Image
 import io
 import pytesseract
@@ -11,25 +12,37 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# --- Tesseract config ---
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+
+# --- FastAPI App ---
 app = FastAPI()
 
+# ✅ CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://app.cloudsyncdigital.com"],  # Frontend origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Google Sheets Config ---
 SERVICE_ACCOUNT_FILE = 'service_account.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SPREADSHEET_ID = '12Dgde7jGtlpJHoefyXiG8tecveQ6qc-mwzUyI3FTPrY'
 
+# --- Google Sheets Helpers ---
 def get_sheets_service():
-    """Authenticates and returns a Google Sheets API service object."""
     try:
         creds = service_account.Credentials.from_service_account_file(
             SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         service = build('sheets', 'v4', credentials=creds)
         return service
-    except HttpError as error:
+    except HttpError:
         raise HTTPException(status_code=500, detail="Google Sheets authentication error.")
 
 def append_to_sheet(sheet_name: str, values: list):
-    """Appends a row of values to the specified Google Sheet tab."""
     service = get_sheets_service()
     range_name = f'{sheet_name}!A:Z'
     body = {'values': [values]}
@@ -47,20 +60,20 @@ def append_to_sheet(sheet_name: str, values: list):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
+# --- OCR Preprocessing ---
 def preprocess_image_for_ocr(pil_image):
     img_cv = np.array(pil_image)
     if len(img_cv.shape) == 3:
         img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
-    # Use Gaussian Blur to reduce noise before thresholding
     blurred_img = cv2.GaussianBlur(img_cv, (5, 5), 0)
     processed_img_cv = cv2.adaptiveThreshold(
         blurred_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
     )
     return Image.fromarray(processed_img_cv)
 
+# --- Main Endpoint ---
 @app.post("/extract-invoice-data/")
 async def extract_invoice_data(image: UploadFile = File(...)):
-    """Processes invoice image, extracts data, and appends to Google Sheets."""
     try:
         image_bytes = await image.read()
         pil_image = Image.open(io.BytesIO(image_bytes))
@@ -73,25 +86,34 @@ async def extract_invoice_data(image: UploadFile = File(...)):
             match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
             return match.group(1).strip() if match else default
 
-        # Improved regex for more accuracy
+        # Extracted Fields
         extracted_data['Sales_Invoice_No'] = safe_search(r'Invoice No\W*(\d+)', raw_text)
         extracted_data['Customer_Name'] = safe_search(r'Customer:\W*(.+?)(?=\nDate|TAX NUMBER|$)', raw_text)
         extracted_data['Date'] = safe_search(r'Date:\W*(\d{2}/\d{2}/\d{4})', raw_text)
         extracted_data['TAX_NUMBER'] = safe_search(r'TAX NUMBER:\W*(\d+)', raw_text)
         extracted_data['Company_Name'] = safe_search(r'BREAD BASKET\s*COMPANY', raw_text)
-        
+
+        # Item Table Extraction
         items_raw = re.findall(r'^\s*(\d+)\s+(.+?)\s+([\d.]+)\s+([A-Za-z]+)\s+([\d.]+)\s+([\d.]+)', raw_text, re.MULTILINE)
         extracted_data['Items'] = []
         for row in items_raw:
-            item_dict = {'Item_No': row[0], 'Item_Name': row[1].replace('"', '').strip(), 'Qty': float(row[2]), 'Unit': row[3], 'Price': float(row[4]), 'Total_Price': float(row[5])}
+            item_dict = {
+                'Item_No': row[0],
+                'Item_Name': row[1].replace('"', '').strip(),
+                'Qty': float(row[2]),
+                'Unit': row[3],
+                'Price': float(row[4]),
+                'Total_Price': float(row[5])
+            }
             extracted_data['Items'].append(item_dict)
 
+        # Totals
         extracted_data['Total_Summary'] = safe_search(r'Total:\W*([\d.]+)', raw_text)
         extracted_data['Discount'] = safe_search(r'Discount:\W*([\d.]+)', raw_text)
         extracted_data['Net_Amount'] = safe_search(r'Net:\W*([\d.]+)', raw_text)
         extracted_data['Sales_Tax'] = safe_search(r'Sales tax:\W*([\d.]+)', raw_text)
 
-        # Append data to Google Sheets
+        # Append to Google Sheets
         if extracted_data['Sales_Invoice_No'] != 'N/A':
             sheet1_row_values = [
                 extracted_data.get('Sales_Invoice_No', ''),
