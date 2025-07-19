@@ -9,4 +9,4 @@ google-auth-oauthlib
 python-multipart
 opencv-python
 gunicorn
- pytesseract
+opencv-python-headless
