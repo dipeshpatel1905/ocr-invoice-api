@@ -146,7 +146,7 @@ async def extract_invoice_data(image: UploadFile = File(...)):
         data['table'] = table
         logger.info("✅ Extracted table with %d rows", len(table))
 
-        vision_key = os.environ.get("VISION_API_KEY")
+        vision_key = os.environ.get("AIzaSyCSESC-OnHIWZ8jH4exxeeRiy9v_-sV2YE")
         if not vision_key:
             raise RuntimeError("VISION_API_KEY not set in env")
 
